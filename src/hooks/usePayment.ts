@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo } from 'react';
 import { useWallet } from './useWallet';
-import PaymentService, { type PaymentRequest } from '../services/payment.service';
+import { createPayment, pollPaymentStatus, type PaymentRequest } from '../services/payment.service';
 import { STELLAR_CONFIG, getAsset } from '../config/stellar.config';
 import type { 
   PaymentDetails, 
@@ -8,17 +8,38 @@ import type {
   PaymentStep, 
   StellarAssetCode, 
   StellarAsset,
-  PaymentBreakdown 
+  PaymentBreakdown,
 } from '../types/payment.types';
+import PaymentService from '../services/payment.service';
 
-const PLATFORM_FEE_PERCENT = 0.05; // 5%
+const PLATFORM_FEE_PERCENT = 0.05;
+const QUOTE_REFRESH_THRESHOLD = 15; // seconds
+const RATE_DRIFT_THRESHOLD = 0.01; // 1%
+
+const ASSETS: Record<StellarAssetCode, StellarAsset> = {
+  XLM:   { code: 'XLM',   name: 'Lumen',      icon: '🚀', balance: 450.25, priceInUSD: 0.12 },
+  USDC:  { code: 'USDC',  name: 'USD Coin',    icon: '💵', balance: 125.50, priceInUSD: 1.00 },
+  PYUSD: { code: 'PYUSD', name: 'PayPal USD',  icon: '🅿️', balance: 85.00,  priceInUSD: 1.00 },
+};
+
+const service = new PaymentService();
+
+const newIdempotencyKey = () => crypto.randomUUID();
 
 export const usePayment = (details: PaymentDetails) => {
   const { wallet, connectWallet: connectWalletHook, sendPayment } = useWallet();
   const [state, setState] = useState<PaymentState>({
     step: wallet ? 'method' : 'connect',
     selectedAsset: 'XLM',
+    idempotencyKey: newIdempotencyKey(),
   });
+
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshingRef = useRef(false);
+
+  const selectedAssetData = useMemo(() => ASSETS[state.selectedAsset], [state.selectedAsset]);
+
+
 
   const assets = useMemo((): StellarAsset[] => {
     if (!wallet?.balance) return [];
@@ -53,6 +74,73 @@ export const usePayment = (details: PaymentDetails) => {
     };
   }, [details.amount, selectedAssetData, state.selectedAsset]);
 
+  // ── Quote helpers ──────────────────────────────────────────────────────────
+
+  const stopCountdown = useCallback(() => {
+    if (countdownRef.current) {
+      clearInterval(countdownRef.current);
+      countdownRef.current = null;
+    }
+  }, []);
+
+  const fetchQuote = useCallback(async (prevReceiveAmount?: number) => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setState(prev => ({ ...prev, quoteRefreshing: true, rateUpdated: false }));
+
+    try {
+      const quote = await service.getQuote(details.amount, state.selectedAsset);
+      const secondsLeft = Math.max(
+        0,
+        Math.floor((new Date(quote.expiresAt).getTime() - Date.now()) / 1000),
+      );
+
+      const drifted =
+        prevReceiveAmount !== undefined &&
+        Math.abs(quote.receiveAmount - prevReceiveAmount) / prevReceiveAmount > RATE_DRIFT_THRESHOLD;
+
+      setState(prev => ({
+        ...prev,
+        quote,
+        quoteSecondsLeft: secondsLeft,
+        quoteRefreshing: false,
+        rateUpdated: drifted,
+        previousReceiveAmount: drifted ? prevReceiveAmount : undefined,
+      }));
+    } catch {
+      setState(prev => ({ ...prev, quoteRefreshing: false }));
+    } finally {
+      refreshingRef.current = false;
+    }
+  }, [details.amount, state.selectedAsset]);
+
+  const startCountdown = useCallback((initialSeconds: number, currentReceiveAmount: number) => {
+    stopCountdown();
+    let seconds = initialSeconds;
+
+    countdownRef.current = setInterval(async () => {
+      seconds -= 1;
+      setState(prev => ({ ...prev, quoteSecondsLeft: seconds }));
+
+      if (seconds <= QUOTE_REFRESH_THRESHOLD && !refreshingRef.current) {
+        stopCountdown();
+        await fetchQuote(currentReceiveAmount);
+        // Countdown restarts via the effect below once new quote lands
+      }
+    }, 1000);
+  }, [stopCountdown, fetchQuote]);
+
+  // Restart countdown whenever a fresh quote arrives
+  useEffect(() => {
+    if (state.quote && !state.quoteRefreshing && state.quoteSecondsLeft !== undefined) {
+      startCountdown(state.quoteSecondsLeft, state.quote.receiveAmount);
+    }
+    return stopCountdown;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.quote?.quoteId]);
+
+  // ── Step transitions ───────────────────────────────────────────────────────
+
   const setStep = useCallback((step: PaymentStep) => {
     setState(prev => ({ ...prev, step }));
   }, []);
@@ -61,21 +149,20 @@ export const usePayment = (details: PaymentDetails) => {
     setState(prev => ({ ...prev, selectedAsset: asset }));
   }, []);
 
-  const connectWallet = useCallback(async () => {
-    try {
-      await connectWalletHook();
-      setState(prev => ({ ...prev, step: 'method' }));
-    } catch (error) {
-      console.error('Wallet connection error:', error);
-      setState(prev => ({ 
-        ...prev, 
-        step: 'error', 
-        error: error instanceof Error ? error.message : 'Failed to connect wallet' 
-      }));
-    }
-  }, [connectWalletHook]);
+  /** Called when user enters the review screen — fetch initial quote */
+  const enterReview = useCallback(async (asset: StellarAssetCode) => {
+    setState(prev => ({ ...prev, selectedAsset: asset, step: 'review' }));
+    await fetchQuote();
+  }, [fetchQuote]);
+
+  // ── Payment ────────────────────────────────────────────────────────────────
+
+
 
   const processPayment = useCallback(async () => {
+    // Guard against double-submission
+    if (state.isSubmitting || state.step === 'processing') return;
+
     if (!selectedAssetData) {
       setState(prev => ({ 
         ...prev, 
@@ -109,11 +196,11 @@ export const usePayment = (details: PaymentDetails) => {
       }
     }
 
-    setState(prev => ({ ...prev, step: 'processing', error: undefined }));
+    setState(prev => ({ ...prev, step: 'processing', isSubmitting: true, error: undefined }));
 
     try {
-      // Send payment to escrow account (this would be the platform's escrow account)
-      const escrowAccount = STELLAR_CONFIG.platformFeeAccount; // In real implementation, this would be generated per session
+      // Send payment to the per-session escrow contract
+      const escrowAccount = details.escrowContractId ?? STELLAR_CONFIG.contractId;
       
       const transaction = await sendPayment(
         escrowAccount,
@@ -123,7 +210,6 @@ export const usePayment = (details: PaymentDetails) => {
       );
 
       // Create payment record on backend
-      const paymentService = new PaymentService();
       const paymentRequest: PaymentRequest = {
         sessionId: details.sessionId,
         mentorId: details.mentorId,
@@ -132,10 +218,10 @@ export const usePayment = (details: PaymentDetails) => {
         transactionHash: transaction.hash,
       };
 
-      const paymentResponse = await paymentService.createPayment(paymentRequest);
+      const paymentResponse = await createPayment(paymentRequest);
 
       // Poll for payment confirmation
-      const finalStatus = await paymentService.pollPaymentStatus(
+      const finalStatus = await pollPaymentStatus(
         paymentResponse.paymentId,
         (status) => {
           if (status.status === 'failed') {
@@ -152,12 +238,14 @@ export const usePayment = (details: PaymentDetails) => {
         setState(prev => ({ 
           ...prev, 
           step: 'success', 
+          isSubmitting: false,
           transactionHash: finalStatus.transactionHash 
         }));
       } else {
         setState(prev => ({ 
           ...prev, 
           step: 'error', 
+          isSubmitting: false,
           error: 'Payment confirmation timeout.' 
         }));
       }
@@ -167,19 +255,21 @@ export const usePayment = (details: PaymentDetails) => {
       setState(prev => ({ 
         ...prev, 
         step: 'error', 
+        isSubmitting: false,
         error: error instanceof Error ? error.message : 'Payment failed.' 
       }));
     }
-  }, [breakdown.totalAmount, selectedAssetData, state.selectedAsset, wallet, connectWallet, sendPayment, details]);
+  }, [breakdown.totalAmount, selectedAssetData, state.selectedAsset, state.isSubmitting, state.step, wallet, connectWallet, sendPayment, details]);
 
   const retry = useCallback(() => {
-    setState(prev => ({ ...prev, step: 'review', error: undefined }));
+    setState(prev => ({ ...prev, step: 'review', isSubmitting: false, error: undefined }));
   }, []);
 
   const reset = useCallback(() => {
     setState({
       step: 'method',
       selectedAsset: 'XLM',
+      isSubmitting: false,
     });
   }, []);
 
@@ -190,6 +280,7 @@ export const usePayment = (details: PaymentDetails) => {
     selectedAssetData,
     setStep,
     selectAsset,
+    enterReview,
     connectWallet,
     processPayment,
     retry,

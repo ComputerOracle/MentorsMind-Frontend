@@ -1,159 +1,217 @@
-import React, { useState } from 'react';
-import { useSessionHistory } from '../hooks/useSessionHistory';
+import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import Button from '../components/ui/Button';
+import SessionHistoryCard from '../components/session/SessionHistoryCard';
+import DisputeFormModal from '../components/session/DisputeFormModal';
+import { SkeletonCard } from '../components/animations/SkeletonLoader';
+import { useBookingHistory, TabKey, StatusFilter } from '../hooks/useBookingHistory';
 import { useFeedback } from '../hooks/useFeedback';
-import { useEscrow } from '../hooks/useEscrow';
-import HistoryList from '../components/learner/HistoryList';
-import LearningProgress from '../components/learner/LearningProgress';
-import LearnerNotes from '../components/learner/LearnerNotes';
 import FeedbackForm from '../components/learner/FeedbackForm';
 import FeedbackHistory from '../components/learner/FeedbackHistory';
-import EscrowStatus from '../components/payment/EscrowStatus';
-import EscrowTimeline from '../components/payment/EscrowTimeline';
 
-const SessionHistory: React.FC = () => {
-  const { sessions, loading, exportReport } = useSessionHistory();
-  const [activeTab, setActiveTab] = useState<'progress' | 'history' | 'notes' | 'feedback' | 'escrow'>('progress');
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const feedback = useFeedback();
-  
-  // Escrow hook for learner view
-  const {
-    escrows,
-    loading: escrowLoading,
-    releaseEscrow,
-    disputeEscrow,
-    getEscrowBySessionId,
-    getCountdown,
-    canRelease,
-    canDispute,
-    isWithinDisputeWindow
-  } = useEscrow({ userRole: 'learner', userId: 'learner-001' });
 
-  if (loading) {
-    return (
-      <div className="max-w-7xl mx-auto px-4 py-8">
-        <div className="animate-pulse space-y-4">
-          <div className="h-8 bg-gray-200 rounded w-1/4" />
-          <div className="h-64 bg-gray-200 rounded" />
-        </div>
+
+function EmptyState({ tab }: { tab: TabKey }) {
+  const navigate = useNavigate();
+  return (
+    <div className="flex flex-col items-center justify-center py-16 text-center">
+      <div className="w-16 h-16 mb-4 rounded-full bg-indigo-50 flex items-center justify-center">
+        <svg className="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+            d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
       </div>
-    );
-  }
+      {tab === 'upcoming' ? (
+        <>
+          <p className="text-base font-semibold text-gray-900">No upcoming sessions</p>
+          <p className="text-sm text-gray-500 mt-1 mb-4">Book a session with a mentor to get started.</p>
+          <Button onClick={() => navigate('/mentors')}>Browse mentors</Button>
+        </>
+      ) : (
+        <>
+          <p className="text-base font-semibold text-gray-900">No past sessions yet</p>
+          <p className="text-sm text-gray-500 mt-1 mb-4">Your completed sessions will appear here.</p>
+          <Button onClick={() => navigate('/mentors')}>Find a mentor</Button>
+        </>
+      )}
+    </div>
+  );
+}
+
+export type SessionHistoryTab = TabKey | 'feedback';
+
+export default function SessionHistory() {
+  const navigate = useNavigate();
+  const {
+    tab: _bookingTab, switchTab: switchBookingTab,
+    filters, updateFilter,
+    bookings,
+    totalCount,
+    hasMore,
+    loadMore,
+    isLoading: isHookLoading,
+    isInDisputeWindow,
+  } = useBookingHistory();
+
+  const { history, editFeedback, submitFeedback } = useFeedback();
+
+  const [tab, setTab] = useState<SessionHistoryTab>('upcoming');
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [selectedBookingForDispute, setSelectedBookingForDispute] = useState<{ id: string, txId: string } | null>(null);
+  
+  useEffect(() => {
+    const timer = setTimeout(() => setIsLoading(false), 800);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const showSkeleton = isLoading || isHookLoading;
+
+  const handleLeaveReview = (id: string) => console.log('Leave review', id);
+  const handleOpenDispute = (id: string, transactionId?: string | null) => {
+    if (transactionId) {
+      setSelectedBookingForDispute({ id, txId: transactionId });
+    }
+  };
+  const handleViewReceipt = (url: string) => window.open(url, '_blank');
 
   return (
-    <div className="max-w-7xl mx-auto px-4 py-8 animate-in fade-in duration-700">
-      <div className="flex flex-wrap justify-between items-center gap-6 mb-8">
-        <div>
-          <h1 className="text-4xl font-black text-gray-900 tracking-tight mb-2">
-            Your Learning <span className="text-stellar">Hub</span>
-          </h1>
-          <p className="text-gray-500 font-medium">
-            Track progress, manage notes, and capture session feedback in one workspace.
-          </p>
-        </div>
-
-        <button
-          onClick={exportReport}
-          className="px-6 py-3 bg-stellar text-white rounded-xl font-bold hover:bg-stellar/90 transition-all shadow-lg shadow-stellar/20"
-        >
-          Export Report
-        </button>
-      </div>
-
-      <div className="flex items-center gap-4 border-b border-gray-100 pb-2 mb-6">
-        {(['progress', 'history', 'notes', 'feedback', 'escrow'] as const).map((tab) => (
+    <div className="space-y-6 max-w-3xl">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold text-gray-900">Your Learning History</h1>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm">Export Report</Button>
+          <div className="flex bg-gray-100 p-1 rounded-lg">
           <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={`px-6 py-2.5 rounded-xl text-sm font-bold transition-all ${
-              activeTab === tab
-                ? 'bg-stellar text-white shadow-lg shadow-stellar/20'
-                : 'text-gray-400 hover:text-gray-600'
+            onClick={() => { setTab('upcoming'); switchBookingTab('upcoming'); }}
+            className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-all ${
+              tab === 'upcoming' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
             }`}
           >
-            {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            Upcoming
           </button>
-        ))}
+          <button
+            onClick={() => { setTab('past'); switchBookingTab('past'); }}
+            className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-all ${
+              tab === 'past' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            Past
+          </button>
+          <button
+            onClick={() => setTab('feedback')}
+            className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-all ${
+              tab === 'feedback' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            Feedback
+          </button>
+        </div>
+        </div>
       </div>
 
-      {activeTab === 'progress' && <LearningProgress />}
-      {activeTab === 'history' && <HistoryList sessions={sessions} />}
-      {activeTab === 'notes' && <LearnerNotes />}
-      {activeTab === 'feedback' && (
-        <div className="space-y-6">
-          <FeedbackForm {...feedback} />
-          <FeedbackHistory history={feedback.history} onEdit={feedback.editFeedback} />
-        </div>
-      )}
-      {activeTab === 'escrow' && (
-        <div className="space-y-6">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h2 className="text-xl font-bold text-gray-900">Escrow Contracts</h2>
-              <p className="text-sm text-gray-500">Manage your session payment escrows</p>
-            </div>
+      <div className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm">
+        <h2 className="text-sm font-bold text-gray-400 uppercase tracking-wider">Time Invested</h2>
+        <p className="text-2xl font-bold text-gray-900 mt-1">12.5 hours</p>
+      </div>
+
+      {tab === 'past' && (
+        <div className="flex flex-wrap gap-3 items-end bg-white p-4 rounded-xl border border-gray-100 shadow-sm">
+          <div>
+            <label className="block text-xs font-bold uppercase tracking-wider text-gray-400 mb-1.5">Status</label>
             <select
-              value={selectedSessionId || ''}
-              onChange={(e) => setSelectedSessionId(e.target.value || null)}
-              className="px-4 py-2 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-700 focus:outline-none focus:ring-2 focus:ring-stellar"
+              value={filters.status}
+              onChange={(e) => updateFilter('status', e.target.value as StatusFilter)}
+              className="text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-gray-50"
             >
-              <option value="">All Escrows</option>
-              {escrows.map((escrow) => (
-                <option key={escrow.id} value={escrow.sessionId}>
-                  Session {escrow.sessionId} - {escrow.amount} {escrow.asset}
-                </option>
-              ))}
+              <option value="all">All Statuses</option>
+              <option value="completed">Completed</option>
+              <option value="cancelled">Cancelled</option>
             </select>
           </div>
+          <div>
+            <label className="block text-xs font-bold uppercase tracking-wider text-gray-400 mb-1.5">From</label>
+            <input
+              type="date"
+              value={filters.dateFrom}
+              onChange={(e) => updateFilter('dateFrom', e.target.value)}
+              className="text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-gray-50"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-bold uppercase tracking-wider text-gray-400 mb-1.5">To</label>
+            <input
+              type="date"
+              value={filters.dateTo}
+              onChange={(e) => updateFilter('dateTo', e.target.value)}
+              className="text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-gray-50"
+            />
+          </div>
+          {(filters.status !== 'all' || filters.dateFrom || filters.dateTo) && (
+            <button
+              onClick={() => { updateFilter('status', 'all'); updateFilter('dateFrom', ''); updateFilter('dateTo', ''); }}
+              className="text-xs text-indigo-600 font-bold hover:text-indigo-700 pb-2.5"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
 
-          {escrowLoading ? (
-            <div className="animate-pulse space-y-4">
-              <div className="h-48 bg-gray-200 rounded-2xl" />
-              <div className="h-64 bg-gray-200 rounded-2xl" />
-            </div>
-          ) : escrows.length === 0 ? (
-            <div className="text-center py-12 bg-gray-50 rounded-2xl">
-              <p className="text-gray-500">No escrow contracts found</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {(selectedSessionId 
-                ? escrows.filter(e => e.sessionId === selectedSessionId)
-                : escrows
-              ).map((escrow) => (
-                <div key={escrow.id} className="space-y-4">
-                  <EscrowStatus
-                    escrow={escrow}
-                    userRole="learner"
-                    onDispute={() => {
-                      // Show dispute modal or form
-                      const reason = window.prompt('Enter dispute reason (mentor_no_show, unsatisfactory_session, session_cancelled, technical_issues, other):');
-                      if (reason) {
-                        const description = window.prompt('Please describe the issue:');
-                        if (description) {
-                          disputeEscrow({
-                            escrowId: escrow.id,
-                            sessionId: escrow.sessionId,
-                            reason,
-                            description
-                          });
-                        }
-                      }
-                    }}
-                    getCountdown={getCountdown}
-                    canRelease={canRelease(escrow)}
-                    canDispute={canDispute(escrow)}
-                    isWithinDisputeWindow={isWithinDisputeWindow(escrow)}
-                  />
-                  <EscrowTimeline escrow={escrow} />
-                </div>
-              ))}
+      {tab === 'feedback' ? (
+        <div className="space-y-8">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900 mb-4">Post-session feedback</h3>
+            <FeedbackForm onSubmit={submitFeedback} />
+          </div>
+          <div>
+            <FeedbackHistory history={history} onEdit={editFeedback} />
+          </div>
+        </div>
+      ) : showSkeleton ? (
+        <div className="space-y-4">
+          {[1, 2, 3].map(i => <SkeletonCard key={i} variant="booking" />)}
+        </div>
+      ) : bookings.length === 0 ? (
+        <EmptyState tab={((tab as string) === 'feedback' ? 'past' : tab) as TabKey} />
+      ) : (
+        <div className="space-y-4">
+          {bookings.map((b) => (
+            <SessionHistoryCard
+              key={b.id}
+              booking={b}
+              inDisputeWindow={isInDisputeWindow(b)}
+              onLeaveReview={handleLeaveReview}
+              onOpenDispute={handleOpenDispute}
+              onViewReceipt={handleViewReceipt}
+            />
+          ))}
+
+          {hasMore && tab !== 'upcoming' && (
+            <div className="flex justify-center pt-4">
+              <Button variant="outline" onClick={loadMore}>Load more sessions</Button>
             </div>
           )}
         </div>
       )}
+      
+      {selectedBookingForDispute && (
+        <DisputeFormModal
+          isOpen={!!selectedBookingForDispute}
+          onClose={() => setSelectedBookingForDispute(null)}
+          bookingId={selectedBookingForDispute.id}
+          transactionId={selectedBookingForDispute.txId}
+          onSuccess={(disputeId) => {
+            navigate(`/disputes/${disputeId}`);
+          }}
+        />
+      )}
+
+      {totalCount > 0 && !showSkeleton && tab !== 'feedback' && (
+        <p className="text-center text-xs text-gray-400 mt-4">
+          Showing {bookings.length} of {totalCount} session{totalCount !== 1 ? 's' : ''}
+        </p>
+      )}
     </div>
   );
-};
-
-export default SessionHistory;
+}

@@ -2,6 +2,22 @@ import { apiConfig } from "../config/api.config";
 import type { RequestOptions } from "../types/api.types";
 import { request } from "../utils/request.utils";
 
+// ─── Typed errors ─────────────────────────────────────────────────────────────
+
+export class NoSharedBookingError extends Error {
+  constructor() {
+    super("Messaging is only available between users who share at least one booking");
+    this.name = "NoSharedBookingError";
+  }
+}
+
+export class SelfMessageError extends Error {
+  constructor() {
+    super("You cannot message yourself");
+    this.name = "SelfMessageError";
+  }
+}
+
 export interface Message {
   id: string;
   conversationId: string;
@@ -9,6 +25,8 @@ export interface Message {
   senderName: string;
   senderAvatar?: string;
   content: string;
+  /** ts_headline HTML from search — sanitized before rendering */
+  headline?: string;
   timestamp: string;
   read: boolean;
   attachments?: MessageAttachment[];
@@ -28,6 +46,7 @@ export interface Conversation {
   participantName: string;
   participantAvatar?: string;
   participantOnline: boolean;
+  last_seen?: string;
   lastMessage?: Message;
   unreadCount: number;
   updatedAt: string;
@@ -44,9 +63,43 @@ export interface SearchMessagesRequest {
   query: string;
 }
 
+// ─── Global message search (GET /messages/search) ─────────────────────────────
+
+export interface MessageSearchResult {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  senderName: string;
+  senderAvatar?: string;
+  content: string;
+  timestamp: string;
+  read: boolean;
+  /** HTML snippet with <b> tags around matched terms, from the server's headline field */
+  headline?: string;
+}
+
+export interface MessageSearchMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+}
+
+export interface MessageSearchResponse {
+  data: {
+    results: MessageSearchResult[];
+    total: number;
+    page: number;
+    totalPages: number;
+  };
+  meta: MessageSearchMeta;
+}
+
 export default class MessagingService {
   async getConversations(opts?: RequestOptions) {
-    return request<Conversation[]>(
+    return request<{ conversations: Conversation[] }>(
       {
         method: "GET",
         url: apiConfig.url.conversations,
@@ -101,7 +154,7 @@ export default class MessagingService {
   async markAsRead(conversationId: string, opts?: RequestOptions) {
     return request<{ success: boolean }>(
       {
-        method: "PUT",
+        method: "POST",
         url: `${apiConfig.url.conversations}/${conversationId}/read`,
       },
       opts,
@@ -119,14 +172,38 @@ export default class MessagingService {
     );
   }
 
-  async createConversation(participantId: string, opts?: RequestOptions) {
-    return request<Conversation>(
+  /**
+   * Global message search across all conversations.
+   * GET /messages/search?q={query}&page={page}
+   * Returns offset-paginated results with headline HTML for match highlighting.
+   */
+  async searchGlobal(query: string, page = 1, opts?: RequestOptions) {
+    return request<MessageSearchResponse>(
       {
-        method: "POST",
-        url: apiConfig.url.conversations,
-        data: { participantId },
+        method: "GET",
+        url: "/messages/search",
+        params: { q: query, page },
       },
       opts,
     );
+  }
+
+  async createConversation(participantId: string, opts?: RequestOptions) {
+    try {
+      return await request<Conversation>(
+        {
+          method: "POST",
+          url: apiConfig.url.conversations,
+          data: { participantId },
+        },
+        opts,
+      );
+    } catch (err: unknown) {
+      const status = (err as { status?: number; response?: { status?: number } })?.status
+        ?? (err as { response?: { status?: number } })?.response?.status;
+      if (status === 403) throw new NoSharedBookingError();
+      if (status === 400) throw new SelfMessageError();
+      throw err;
+    }
   }
 }

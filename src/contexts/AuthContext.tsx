@@ -1,448 +1,250 @@
-import {
-  createContext,
-  Dispatch,
-  ReactNode,
-  SetStateAction,
-  useCallback,
-  useContext,
-  useEffect,
-  useState,
-} from "react";
-import { ApiError } from "../services/api.error";
-import AuthService from "../services/auth.service";
-import { User, UserRole } from "../types";
-import { clientStorage, sessionStore } from "../utils/client.storage.utils";
-import { setGlobalLogoutHandler } from "../utils/global.logout.utils";
-import { tokenStorage } from "../utils/token.storage.utils";
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useNavigate } from 'react-router-dom';
+import type { User } from '../types';
+import * as authService from '../services/auth.service';
+import { TOKEN_KEY, REFRESH_TOKEN } from '../config/app.config';
+import { WebSocketService, WebSocketConfig } from '../services/websocket.service';
+import { apiConfig } from '../config/api.config';
+import { tokenStorage } from '../utils/token.storage.utils';
 
-interface AuthState {
+export interface MFAPendingState {
+  mfa_token: string;
+}
+
+interface AuthContextType {
   user: User | null;
+  loading: boolean;
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
-  fieldErrors: Record<string, string>;
-}
-
-interface AuthContextType extends AuthState {
-  login: (
-    email: string,
-    password: string,
-    rememberMe?: boolean,
-  ) => Promise<void>;
-  register: (
-    email: string,
-    password: string,
-    name: string,
-    role: "learner" | "mentor",
-  ) => Promise<void>;
+  mfaPending: MFAPendingState | null;
+  login: (email: string, password: string) => Promise<{ mfaRequired: boolean }>;
+  completeMFAChallenge: (totp: string) => Promise<void>;
+  register: (firstName: string, lastName: string, email: string, password: string, role: 'mentor' | 'mentee') => Promise<void>;
   logout: () => Promise<void>;
-  forgotPassword: (email: string) => Promise<void>;
-  resetPassword: (token: string, newPassword: string) => Promise<void>;
   verifyEmail: (token: string) => Promise<void>;
   resendVerification: () => Promise<void>;
   clearError: () => void;
+  /** Refresh the stored user object (e.g. after enabling/disabling MFA) */
+  refreshUser: () => Promise<void>;
+  /** Refresh the access token using refresh token */
+  refreshToken: () => Promise<string | null>;
+  /** Patch the stored user object locally (e.g. after avatar upload) */
+  updateUser: (patch: Partial<User>) => void;
+  /** Set a full session from an external source (e.g. OAuth callback) */
+  setSession: (user: User, token: string, refreshToken: string) => void;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
-const authService = new AuthService();
+const AuthContext = createContext<AuthContextType | null>(null);
+
+function persistSession(user: User, token: string, refreshToken: string) {
+  localStorage.setItem('mm_user', JSON.stringify(user));
+  tokenStorage.setTokens(token, refreshToken);
+}
+
+function clearSession() {
+  localStorage.removeItem('mm_user');
+  tokenStorage.clearTokens();
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<AuthState>({
-    user: null,
-    isAuthenticated: false,
-    isLoading: true,
-    error: null,
-    fieldErrors: {},
-  });
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [mfaPending, setMfaPending] = useState<MFAPendingState | null>(null);
+  const [webSocket, setWebSocket] = useState<WebSocketService | null>(null);
 
   useEffect(() => {
-    // Check for existing session on mount
-    const checkAuth = async () => {
+    // Restore session from storage, then verify with backend.
+    // Using async/await with try/finally guarantees setLoading(false) always runs,
+    // even if JSON.parse throws synchronously or the network call fails unexpectedly.
+    const restoreSession = async () => {
       try {
-        // Check if tokens exist
-        if (tokenStorage.hasTokens()) {
-          // Validate tokens via user data
-          const userRes = await authService.me();
-          const storedUser = clientStorage.getUser("user");
-
-          // const rememberMe = clientStorage.getRememberMe("rememberMe");
-
-          if (userRes && storedUser) {
-            const user = storedUser;
-
-            setState({
-              user,
-              isAuthenticated: true,
-              isLoading: false,
-              error: null,
-              fieldErrors: {},
-            });
-          } else {
-            // Token invalid, clear everything
-            tokenStorage.cleaTokens();
-            clientStorage.clearUser("user");
-            clientStorage.clearRememberMe("rememberMe");
-
-            setState((prev: AuthState) => ({ ...prev, isLoading: false }));
+        const stored = localStorage.getItem('mm_user');
+        const token = tokenStorage.getAccessToken();
+        if (stored && token) {
+          // Optimistically restore user from storage while we verify with backend
+          setUser(JSON.parse(stored));
+          try {
+            const freshUser = await authService.getMe();
+            setUser(freshUser);
+            localStorage.setItem('mm_user', JSON.stringify(freshUser));
+          } catch {
+            // Token expired or network failure — clear everything and show login
+            clearSession();
+            setUser(null);
           }
-        } else {
-          setState((prev: AuthState) => ({ ...prev, isLoading: false }));
         }
-      } catch (error) {
-        console.error(error);
-        // Token validation failed
-        tokenStorage.cleaTokens();
-        clientStorage.clearUser("user");
-        clientStorage.clearRememberMe("rememberMe");
-
-        setState((prev: AuthState) => ({ ...prev, isLoading: false }));
+      } finally {
+        // Always dismiss the loading screen regardless of outcome
+        setLoading(false);
       }
     };
 
-    checkAuth();
+    restoreSession();
   }, []);
 
-  const login = async (email: string, password: string, rememberMe = false) => {
-    setState((prev: AuthState) => ({ ...prev, isLoading: true, error: null }));
-
-    // Mock validation
-    if (!email || !password) {
-      throw new Error("Email and password are required");
-    }
+  const login = async (email: string, password: string): Promise<{ mfaRequired: boolean }> => {
+    setError(null);
     try {
-      const res = await authService.login(email, password);
-
-      // Store tokens
-      tokenStorage.setTokens(res.accessToken, res.refreshToken);
-
-      // Fetch current user data
-      const me = await authService.me();
-      const user: User = {
-        id: me.id,
-        email: me.email,
-        name: me.name,
-        role: me.role,
-        emailVerified: me.emailVerified,
-      };
-
-      // Handle rememberMe
-      if (rememberMe) {
-        clientStorage.setUser("user", user);
-        clientStorage.setRememberMe("rememberMe", true);
-      } else {
-        sessionStore.setUser("user", user);
+      const result = await authService.login(email, password);
+      if ('mfa_required' in result && result.mfa_required) {
+        setMfaPending({ mfa_token: result.mfa_token });
+        return { mfaRequired: true };
       }
-
-      setState({
-        user,
-        isAuthenticated: true,
-        isLoading: false,
-        error: null,
-        fieldErrors: {},
-      });
-    } catch (error) {
-      const fieldErrors: Record<string, string> = {};
-      let errMsg = "Login failed";
-
-      if (error instanceof ApiError) {
-        errMsg = error.message;
-        if (error.validationErrors) {
-          Object.assign(fieldErrors, error.validationErrors);
-        }
-      } else if (error instanceof Error) {
-        errMsg = error.message;
-      }
-
-      setState((prev: AuthState) => ({
-        ...prev,
-        isLoading: false,
-        error: Object.keys(fieldErrors).length ? null : errMsg,
-      }));
-      throw error;
+      const { user, token, refreshToken } = result as authService.MFALoginResponse;
+      persistSession(user, token, refreshToken);
+      setUser(user);
+      initializeWebSocket(token);
+      return { mfaRequired: false };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Login failed. Please try again.';
+      setError(errorMessage);
+      throw err;
     }
   };
 
-  const register = async (
-    email: string,
-    password: string,
-    name: string,
-    role: UserRole,
-  ) => {
-    setState((prev: AuthState) => ({
-      ...prev,
-      isLoading: true,
-      error: null,
-      fieldErrors: {},
-    }));
+  const completeMFAChallenge = async (totp: string) => {
+    if (!mfaPending) throw new Error('No MFA challenge in progress');
+    const { user, token, refreshToken } = await authService.mfaVerify(mfaPending.mfa_token, totp);
+    setMfaPending(null);
+    persistSession(user, token, refreshToken);
+    setUser(user);
+    initializeWebSocket(token);
+  };
 
-    if (!email || !password || !name) {
-      throw new Error("All fields are required");
-    }
-
+  const register = async (firstName: string, lastName: string, email: string, password: string, role: 'mentor' | 'mentee') => {
+    setError(null);
     try {
-      // Call real API
-      const res = await authService.signup(email, password, name, role);
-
-      // Store token
-      tokenStorage.setTokens(res.accessToken, res.refreshToken);
-
-      // Mock Stellar wallet creation
-      const stellarPublicKey =
-        "G" + Math.random().toString(36).substring(2, 15).toUpperCase();
-
-      // Fetch user data
-      const userRes = await authService.me();
-
-      const user: User = {
-        id: userRes.id,
-        email: userRes.email,
-        name: userRes.email,
-        role: userRes.role,
-        stellarPublicKey,
-        emailVerified: userRes.emailVerified,
-      };
-
-      sessionStore.setUser("user", user);
-
-      setState({
-        user,
-        isAuthenticated: true,
-        isLoading: false,
-        error: null,
-        fieldErrors: {},
-      });
-    } catch (error) {
-      catchError(error, setState, "Registration failed");
-
-      throw error;
+      const { user, token, refreshToken } = await authService.register(firstName, lastName, email, password, role);
+      persistSession(user, token, refreshToken);
+      setUser(user);
+      initializeWebSocket(token);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Registration failed. Please try again.';
+      setError(errorMessage);
+      throw err;
     }
   };
 
   const logout = async () => {
-    setState((prev: AuthState) => ({ ...prev, isLoading: true }));
-
-    try {
-      // API call
-      await authService.logout();
-
-      tokenStorage.cleaTokens();
-      clientStorage.clearUser("user");
-      clientStorage.clearRememberMe("user");
-      sessionStore.clearUser("user");
-
-      setState({
-        user: null,
-        isAuthenticated: false,
-        isLoading: false,
-        error: null,
-        fieldErrors: {},
-      });
-    } catch (error) {
-      catchError(error, setState, "Logout failed");
-
-      // setState((prev: AuthState) => ({
-      //   ...prev,
-      //   isLoading: false,
-      //   error: error instanceof Error ? error.message : "Logout failed",
-      // }));
+    if (webSocket) {
+      webSocket.disconnect();
+      setWebSocket(null);
     }
+    await authService.logout();
+    clearSession();
+    setMfaPending(null);
+    setUser(null);
+    setError(null);
   };
-
-  const forgotPassword = async (email: string) => {
-    setState((prev: AuthState) => ({ ...prev, isLoading: true, error: null }));
-
-    const signal = new AbortSignal();
-
-    if (!email) {
-      throw new Error("Email is required");
-    }
-
-    try {
-      // API call
-      await authService.forgotPassword(email, { signal });
-
-      setState((prev: AuthState) => ({ ...prev, isLoading: false }));
-    } catch (error) {
-      catchError(error, setState, "Failed to send reset email");
-      // setState((prev: AuthState) => ({
-      //   ...prev,
-      //   isLoading: false,
-      //   error:
-      //     error instanceof Error ? error.message : "Failed to send reset email",
-      // }));
-      throw error;
-    }
-  };
-
-  const resetPassword = async (token: string, newPassword: string) => {
-    if (!token || !newPassword) {
-      throw new Error("Invalid reset token or password");
-    }
-
-    const signal = new AbortSignal();
-    setState((prev: AuthState) => ({ ...prev, isLoading: true, error: null }));
-
-    try {
-      // API call
-      await authService.resetPassword(token, newPassword, { signal });
-
-      setState((prev: AuthState) => ({ ...prev, isLoading: false }));
-    } catch (error) {
-      catchError(error, setState, "Password reset failed");
-
-      // setState((prev: AuthState) => ({
-      //   ...prev,
-      //   isLoading: false,
-      //   error: error instanceof Error ? error.message : "Password reset failed",
-      // }));
-      throw error;
-    }
-  };
-
+  
   const verifyEmail = async (token: string) => {
-    if (!token) {
-      throw new Error("Invalid verification token");
-    }
-
-    setState((prev: AuthState) => ({ ...prev, isLoading: true, error: null }));
-    const signal = new AbortSignal();
-
+    setError(null);
     try {
-      // API call
-      const isVerifiedEmail = await authService.verifyEmail(token, { signal });
-
-      if (isVerifiedEmail && state.user) {
-        const updatedUser = { ...state.user, emailVerified: true };
-
-        setState((prev: AuthState) => ({
-          ...prev,
-          user: updatedUser,
-          isLoading: false,
-        }));
-
-        clientStorage.setUser("user", updatedUser);
-      }
-
-      // Update stored user
-    } catch (error) {
-      catchError(error, setState, "Email verification failed");
-      // setState((prev: AuthState) => ({
-      //   ...prev,
-      //   isLoading: false,
-      //   error:
-      //     error instanceof Error ? error.message : "Email verification failed",
-      // }));
-      throw error;
+      await authService.verifyEmail(token);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Email verification failed.';
+      setError(errorMessage);
+      throw err;
     }
   };
 
   const resendVerification = async () => {
-    setState((prev: AuthState) => ({ ...prev, isLoading: true, error: null }));
-
-    if (!state.user?.email) {
-      throw new Error("No user email found");
-    }
-
-    const signal = new AbortSignal();
-
+    setError(null);
     try {
-      // API call
-      const isVerifiedEmail = await authService.resendVerification(
-        state.user.email,
-        { signal },
-      );
-
-      setState((prev: AuthState) => ({
-        ...prev,
-        isLoading: false,
-        user: prev.user
-          ? { ...prev.user, emailVerified: isVerifiedEmail }
-          : null,
-      }));
-    } catch (error) {
-      catchError(error, setState, "Failed to resend verification");
-      // setState((prev: AuthState) => ({
-      //   ...prev,
-      //   isLoading: false,
-      //   error:
-      //     error instanceof Error
-      //       ? error.message
-      //       : "Failed to resend verification",
-      // }));
-      throw error;
+      await authService.resendVerification();
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to resend verification email.';
+      setError(errorMessage);
+      throw err;
     }
   };
 
   const clearError = () => {
-    setState((prev: AuthState) => ({ ...prev, error: null }));
+    setError(null);
   };
 
-  const forceLogout = useCallback(() => {
-    tokenStorage.cleaTokens();
-    clientStorage.clearUser("user");
-    clientStorage.clearRememberMe("rememberMe");
-    sessionStore.clearUser("user");
+  const refreshUser = async () => {
+    const freshUser = await authService.getMe();
+    setUser(freshUser);
+    localStorage.setItem('mm_user', JSON.stringify(freshUser));
+  };
 
-    setState({
-      user: null,
-      isAuthenticated: false,
-      isLoading: false,
-      error: "Your session has expired. Please sign in again.",
-      fieldErrors: {},
+  const refreshToken = async (): Promise<string | null> => {
+    const refreshTokenValue = localStorage.getItem(REFRESH_TOKEN);
+    if (!refreshTokenValue) return null;
+
+    try {
+      const { token, refreshToken: newRefreshToken } = await authService.refreshToken(refreshTokenValue);
+      localStorage.setItem(TOKEN_KEY, token);
+      localStorage.setItem(REFRESH_TOKEN, newRefreshToken);
+      return token;
+    } catch (error) {
+      console.error('Token refresh failed:', error);
+      // If refresh fails, logout
+      clearSession();
+      setUser(null);
+      return null;
+    }
+  };
+
+  const initializeWebSocket = (token: string) => {
+    if (webSocket) {
+      webSocket.disconnect();
+    }
+    const config: WebSocketConfig = {
+      url: apiConfig.wsURL,
+      onTokenRefresh: refreshToken,
+    };
+    const ws = new WebSocketService(config);
+    setWebSocket(ws);
+    ws.connect(token).catch(console.error);
+  };
+
+  const updateUser = (patch: Partial<User>) => {
+    setUser((prev: User | null) => {
+      if (!prev) return prev;
+      const updated = { ...prev, ...patch };
+      localStorage.setItem('mm_user', JSON.stringify(updated));
+      return updated;
     });
-  }, []);
+  };
 
-  // Register forceLogout globally once on mount
-  useEffect(() => {
-    setGlobalLogoutHandler(forceLogout);
-  }, [forceLogout]);
+  const setSession = (user: User, token: string, refreshToken: string) => {
+    persistSession(user, token, refreshToken);
+    setUser(user);
+    setError(null);
+    setMfaPending(null);
+  };
 
   return (
-    <AuthContext.Provider
-      value={{
-        ...state,
-        login,
-        register,
-        logout,
-        forgotPassword,
-        resetPassword,
-        verifyEmail,
-        resendVerification,
-        clearError,
-      }}
-    >
+    <AuthContext.Provider value={{
+      user,
+      loading,
+      isAuthenticated: !!user,
+      isLoading: loading,
+      error,
+      mfaPending,
+      login,
+      completeMFAChallenge,
+      register,
+      logout,
+      clearError,
+      verifyEmail,
+      resendVerification,
+      clearError, 
+      refreshUser,
+      updateUser,
+      refreshToken
+    }}>
       {children}
     </AuthContext.Provider>
   );
 }
 
-function catchError(
-  error: unknown,
-  setState: Dispatch<SetStateAction<AuthState>>,
-  errMsg: string,
-) {
-  const fieldErrors: Record<string, string> = {};
-
-  if (error instanceof ApiError) {
-    errMsg = error.message;
-    if (error.validationErrors) {
-      Object.assign(fieldErrors, error.validationErrors);
-    }
-  } else if (error instanceof Error) {
-    errMsg = error.message;
-  }
-
-  setState((prev) => ({
-    ...prev,
-    isLoading: false,
-    error: Object.keys(fieldErrors).length ? null : errMsg,
-  }));
-}
-
 export function useAuthContext() {
-  const context = useContext(AuthContext);
-  if (context === undefined) {
-    throw new Error("useAuthContext must be used within an AuthProvider");
-  }
-  return context;
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuthContext must be used within AuthProvider');
+  return ctx;
 }
